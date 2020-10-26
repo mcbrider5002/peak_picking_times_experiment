@@ -1,0 +1,17 @@
+__MACOSX
+vimms
+MZmine*
+MSDIAL*
+PeakOnly
+peakonly*
+
+data
+xcms_results
+mzmine_results
+msdial_results
+plots
+
+.RData
+*.txt
+*.Rout
+*.xml
