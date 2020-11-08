@@ -12,6 +12,7 @@ from decimal import Decimal
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+from abc import ABC, abstractmethod
 
 from vimms.ChemicalSamplers import DatabaseFormulaSampler
 from vimms.Chemicals import ChemicalMixtureCreator
@@ -30,6 +31,23 @@ from vimms.Common import *
 #more parameter tuning?
 #change saved stuff from generated mzmls to pickle all saved information into one object?
 #do we want to print success of runs at the end?
+#add mass to peak detection check
+#make some convenient way to schedule tasks (e.g. pickle some file metadata to make it easier to plot?)
+#^ what about creating an object for each task type, with a specific contract for plotting etc defined in an abstract class
+#get mzmine centwave?
+#can we train ML to get parameters automatically?
+#can we train ML on *mistakes* or otherwise use these software (majority vote, include them as a feature, etc)?
+#generate time based on some state 'busy' or 'non-busy' with two different distributions
+#0.6 or 2.6 (10 MS2 * 0.2)
+#check ADAP code for using time
+
+#sample unknown chemicals to turn off isotopes
+#presenting how many scans per peak there are as a matter of intuition
+#check that chemical overlap box in vimms actually matches chemical
+#log scan retention time when chemical first appears in a scan as opposed to theoretical RT (vimms)
+#disable noise/check it's equal across algorithms
+#change wavelet parameters for xcms to check bump at 4.0 on 0.9 overlap
+#get peakonly to work
 
 #if no RPath, then we disable runXCMS (and print a warning that this is the reason XCMS was disabled)
 #R also needs access to: library(xcms) and library(magrittr) - how do we ensure this? is there R package manager? do we just try/except and suggest that these packages need to be installed?
@@ -54,13 +72,13 @@ class ConfigurationState():
     vimms_params = OrderedDict([
         ("DATADIR", os.path.join(WRKDIR, "data")),
         ("HMDBPATH", os.path.join(WRKDIR, "vimms", "tests", "fixtures", "hmdb_compounds.p")),
-        ("CHEMICALS", "100")
+        ("CHEMICALS", "500")
     ])
 
     #times to use for generating .mzMLs
     times = OrderedDict([
         #("FIXEDTIMES", "0.1,0.25,0.55,0.75,1,1.5,2"),
-        ("FIXEDTIMES", "1.0,2.0,4.0,8.0,16.0,32.0"),
+        ("FIXEDTIMES", "0.1,1.0,2.0,4.0,6.0,8.0,16.0,32.0"),
         ("UNIFORMMEANS", "7.0"),
         ("UNIFORMSPREADS", ",".join(str(7.0 / 20 * i) for i in range(20))) #distance of boundaries of uniform distribution from the mean
     ])
@@ -215,25 +233,64 @@ def generate_mzmls(c):
     hmdb = load_obj(c.HMDBPATH)
     df = DatabaseFormulaSampler(hmdb, min_mz=100, max_mz=1000)
     cm = ChemicalMixtureCreator(df, adduct_prior_dict={POSITIVE: {"M+H" : 1}})
-    chemicals = cm.sample(c.CHEMICALS,1)
+    chemicals = cm.sample(c.CHEMICALS, 1)
     min_rt, max_rt = min(chem.rt for chem in chemicals) * 0.9, max(chem.rt for chem in chemicals) * 1.1
     for f in os.listdir(c.DATADIR): os.remove(os.path.join(c.DATADIR, f))
     Path(c.DATADIR).mkdir(exist_ok=True)
     with open(os.path.join(c.DATADIR, "rts.txt"), 'w') as rts: rts.write("{},{}".format(min_rt, max_rt))
     save_obj(chemicals, os.path.join(c.DATADIR, "chems.pkl"))
+    
+    class StateGen():
+    
+        NOT_BUSY = 0
+        BUSY = 1
+        
+        def __init__(self, scan_times):
+            self.state = self.BUSY
+            self.rt = min_rt
+            self.scan_times = (scan_times["NOT_BUSY"], scan_times["BUSY"])
+            
+        def scan_time(self):
+            return self.scan_times[self.state]
+        
+        @abstractmethod
+        def new_state(self): pass
+        
+        def __call__(self):
+            self.state = self.new_state()
+            stime = self.scan_time()
+            self.rt += stime
+            return stime
+            
+    class StateRandom(StateGen):
+        
+        def __init__(self, scan_times, p):
+            super().__init__(scan_times)
+            self.p = p
+        
+        def new_state(self): return int(not self.state) if self.p >= random.uniform(0, 1) else self.state
+    
+    class StateHalves(StateGen):
+        def new_state(self): return self.NOT_BUSY if self.rt >= (min_rt + max_rt) / 2 else self.BUSY
+        
+    scan_times = {"NOT_BUSY" : 0.6, "BUSY" : 10}
+    srandoms = [StateRandom(scan_times, p) for p in [0.01, 0.03, 0.05, 0.1, 0.2]]
+    shalves = [StateHalves(scan_times)]
 
     def ugen(umean, uspread): return lambda: random.uniform(umean-uspread, umean+uspread)
     uniforms = [ugen(umean, uspread) for umean in c.UNIFORMMEANS for uspread in c.UNIFORMSPREADS if umean >= uspread]
     def chgen(ls): return lambda: random.choice(ls)
-    choices = [chgen(ls) for ls in [[1] * i + [3] + [5] * i for i in range(1, 6)]]
-    def itgen(v, p): return v + itgen(v, p) if p >= random.uniform(0, 1) else v
+    choices = [chgen(ls) for ls in [[9] * i + [11] + [13] * i for i in range(1, 101, 10)]]
+    def itgen(v, p): 
+        def recurse(v, p): return v + recurse(v, p) if p >= random.uniform(0, 1) else v
+        return lambda: recurse(v, p)
     iteratives = [itgen(v, p) for v in [1, 3, 5] for p in [0.1, 0.3, 0.5, 0.7, 0.9]]
     
-    c.PARTITION_NAMES = ["Fixed", "Uniform", "Choice", "Recursive"]
-    c.PARTITIONS = [0] + [len(c.FIXEDTIMES), len(uniforms), len(choices), len(iteratives)]
-    c.XLABELS = ["Time Steps", "Spread", "Padding Width", "(Timestep, p)"]
-    c.XTICKS = [[str(f) for f in c.FIXEDTIMES], ["%.2f" % u for u in c.UNIFORMSPREADS], list(range(1, 6)), [(v, p) for v in [1, 3, 5] for p in [0.1, 0.3, 0.5, 0.7, 0.9]]]
-    scan_duration_dicts = [{1 : v} for v in (c.FIXEDTIMES + uniforms + choices + iteratives)]
+    c.PARTITION_NAMES = ["Fixed", "Uniform", "Choice", "Recursive", "Markov"]
+    c.PARTITIONS = [0] + [len(c.FIXEDTIMES), len(uniforms), len(choices), len(iteratives), len(srandoms)]
+    c.XLABELS = ["Time Steps", "Spread", "Padding Width", "(Timestep, p)", "p"]
+    c.XTICKS = [[str(f) for f in c.FIXEDTIMES], ["%.2f" % u for u in c.UNIFORMSPREADS], list(range(1, 101, 10)), [(v, p) for v in [1, 3, 5] for p in [0.1, 0.3, 0.5, 0.7, 0.9]], [p for p in [0.01, 0.03, 0.05, 0.1, 0.2]]]
+    scan_duration_dicts = [{1 : v} for v in (c.FIXEDTIMES + uniforms + choices + iteratives + srandoms + shalves)]
     
     for i, d in enumerate(scan_duration_dicts):
         mass_spec = IndependentMassSpectrometer(POSITIVE, chemicals, None, scan_duration_dict=d)
@@ -339,18 +396,24 @@ def match_peaks(c, chems):
     class PPFile():
     
         class Peak():
-            def __init__(self, min_rt, rt, max_rt, unit_conv=1):
+            def __init__(self, min_rt, rt, max_rt, min_mass, max_mass, unit_conv=1):
                 units = Decimal(unit_conv)
                 self.min_rt = Decimal(min_rt) * units
                 self.rt = Decimal(rt) * units
                 self.max_rt = Decimal(max_rt) * units
+                self.min_mass = None if min_mass is None else Decimal(min_mass)
+                self.max_mass = None if max_mass is None else Decimal(max_mass)
                 
             def __repr__(self): return "({}, {}, {})".format(self.min_rt, self.rt, self.max_rt)
                 
             def compare_to_chem(self, chem, overlap_ratio):
                 intersecting = max(0, min(chem["max_rt"], self.max_rt) - max(chem["min_rt"], self.min_rt))
                 union = (chem["max_rt"] - chem["min_rt"] + self.max_rt - self.min_rt - intersecting)
-                return intersecting >= union * Decimal(overlap_ratio)    
+                mass_bounds = self.min_mass is None or self.max_mass is None
+                if(not mass_bounds):
+                    minm, maxm = self.min_mass * (1 - overlap_ratio * Decimal(0.1)), self.max_mass * (Decimal(1) + overlap_ratio * Decimal(0.1))
+                    mass_bounds = mass_bounds or (chem["m/z"] >= minm and chem["m/z"] <= maxm)
+                return intersecting >= union * Decimal(overlap_ratio) and mass_bounds
                 
         def __init__(self, peaks):
             self.peaks = peaks
@@ -370,7 +433,9 @@ def match_peaks(c, chems):
             def to_peak(p):
                 left_header = next(k for k in p.keys() if k.endswith("Peak RT start\""))
                 right_header = next(k for k in p.keys() if k.endswith("Peak RT end\""))
-                return cls.Peak(p[left_header], p["\"row retention time\""], p[right_header])
+                min_mass = next(k for k in p.keys() if k.endswith("Peak m/z min\""))
+                max_mass = next(k for k in p.keys() if k.endswith("Peak m/z max\""))
+                return cls.Peak(p[left_header], p["\"row retention time\""], p[right_header], p[min_mass], p[max_mass])
             return PPFile([to_peak(p) for p in peaks])
         
         @classmethod
@@ -379,13 +444,15 @@ def match_peaks(c, chems):
             def to_peak(p):
                 left_header = next(k for k in p.keys() if k.endswith("Peak RT start"))
                 right_header = next(k for k in p.keys() if k.endswith("Peak RT end"))
-                return cls.Peak(p[left_header], p["row retention time"], p[right_header], unit_conv=60)
+                min_mass = next(k for k in p.keys() if k.endswith("Peak m/z min"))
+                max_mass = next(k for k in p.keys() if k.endswith("Peak m/z max"))
+                return cls.Peak(p[left_header], p["row retention time"], p[right_header], p[min_mass], p[max_mass], unit_conv=60)
             return PPFile([to_peak(p) for p in peaks])
         
         @classmethod
         def from_msdial(cls, filepath):
             peaks = cls.load_data(filepath, delim='\t')
-            def to_peak(p): return cls.Peak(p["RT left(min)"], p["RT (min)"], p["RT right (min)"], unit_conv=60)
+            def to_peak(p): return cls.Peak(p["RT left(min)"], p["RT (min)"], p["RT right (min)"], None, None, unit_conv=60)
             return PPFile([to_peak(p) for p in peaks])
         
         def compare_to_chems(self, chems, overlap_ratio=0.9):
@@ -403,24 +470,18 @@ def match_peaks(c, chems):
             missed = len(chems)
             return TP, FP, missed
     
-    def canonise_rt(chem): return {"min_rt" : Decimal(chem.rt) + Decimal(chem.chromatogram.min_rt), "max_rt" : Decimal(chem.rt) + Decimal(chem.chromatogram.max_rt)}
+    def canonise_rt(chem): 
+        return {
+                "min_rt" : Decimal(chem.rt) + Decimal(chem.chromatogram.min_rt), 
+                "max_rt" : Decimal(chem.rt) + Decimal(chem.chromatogram.max_rt),
+                "m/z" : Decimal(chem.mass)
+               }
     chems = [canonise_rt(ch) for ch in chems]
     
-    oratio = 0.7
-    #load all XCMS results, compare pp files to chemical
-    files = [PPFile.from_xcms(f) for f in glob.glob(os.path.join(c.XCMSRESULTS, "*.csv"))]
-    xcms_results = [f.compare_to_chems(chems, overlap_ratio=oratio) for f in files]
-    #load all MZMine results, compare pp files to chemical
-    files = [PPFile.from_mzmine(f) for f in glob.glob(os.path.join(c.MZMINERESULTS, "*.csv"))]
-    mzmine_results = [f.compare_to_chems(chems, overlap_ratio=oratio) for f in files]
-    #load all MSDial results, compare pp files to chemical
-    files = [PPFile.from_msdial(f) for f in [f for f in glob.glob(os.path.join(c.MSDIALRESULTS, "*.msdial")) if not os.path.basename(f).startswith("AlignResult")]]
-    msdial_results = [f.compare_to_chems(chems, overlap_ratio=oratio) for f in files]
-    
-    print(xcms_results)
-    print(mzmine_results)
-    print(msdial_results)
-    
+    xcms_files = [PPFile.from_xcms(f) for f in glob.glob(os.path.join(c.XCMSRESULTS, "*.csv"))]
+    mzmine_files = [PPFile.from_mzmine(f) for f in glob.glob(os.path.join(c.MZMINERESULTS, "*.csv"))]
+    msdial_files = [PPFile.from_msdial(f) for f in [f for f in glob.glob(os.path.join(c.MSDIALRESULTS, "*.msdial")) if not os.path.basename(f).startswith("AlignResult")]]
+
     #choose a colour for each software package, and use a lighter shade for TP, and darker for FP
     xcms_tp_colour = (108.0 / 255, 211.0 / 255, 1.0)
     xcms_fp_colour = (0.0, 122.0 / 255, 174.0 / 255)
@@ -429,7 +490,7 @@ def match_peaks(c, chems):
     msdial_tp_colour = (17.0 / 255, 1.0, 83.0 / 255)
     msdial_fp_colour = (0.0, 147.0 / 255, 40.0 / 255)
         
-    def plot(name, i, i2, xlabel, xticks):
+    def plot(xcms_results, mzmine_results, msdial_results, name, i, i2, xlabel, xticks, oratio):
         xs = list(range(i2 - i))
         xcms_tp, xcms_fp, xcms_missed = list(zip(*xcms_results[i:i2]))
         mzmine_tp, mzmine_fp, mzmine_missed = list(zip(*mzmine_results[i:i2]))
@@ -443,13 +504,13 @@ def match_peaks(c, chems):
         ax.scatter(xs, mzmine_fp, color=mzmine_fp_colour, label="MZMine FP", marker='x')
         ax.scatter(xs, msdial_fp, color=msdial_fp_colour, label="MSDial FP", marker='x')
         
-        ax.set(xlabel=xlabel, ylabel="True/False Positives", title="{} True/False Positives".format(name))
+        ax.set(xlabel=xlabel, ylabel="True/False Positives", title="{} True/False Positives {} Overlap".format(name, oratio))
         ax.set_ylim(ymin=0)
         ax.legend()
         
         plt.xticks(xs, xticks, rotation=45)
         plt.tight_layout()
-        plt.savefig(os.path.join(c.PLOTDIR, "{}_positives.jpg".format(name)))
+        plt.savefig(os.path.join(c.PLOTDIR, "{}_positives_{}.jpg".format(name, oratio)))
         plt.show()
         
         fig, ax = plt.subplots()
@@ -457,19 +518,31 @@ def match_peaks(c, chems):
         ax.scatter(xs, mzmine_missed, color=mzmine_tp_colour, label="MZMine Missed")
         ax.scatter(xs, msdial_missed, color=msdial_tp_colour, label="MSDial Missed")
         
-        ax.set(xlabel=xlabel, ylabel="Chemicals Missed", title="{} Chemicals Missed".format(name))
+        ax.set(xlabel=xlabel, ylabel="Chemicals Missed", title="{} Chemicals Missed {} Overlap".format(name, oratio))
         ax.set_ylim(ymin=0)
         ax.legend()
         
         plt.xticks(xs, xticks, rotation=45)
         plt.tight_layout()
-        plt.savefig(os.path.join(c.PLOTDIR, "{}_missed.jpg".format(name)))
-        plt.show()
+        plt.savefig(os.path.join(c.PLOTDIR, "{}_missed_{}.jpg".format(name, oratio)))
+        plt.show()    
     
-    Path(c.PLOTDIR).mkdir(exist_ok=True)
-    partitions = list(itertools.accumulate(c.PARTITIONS))
-    for name, i, i2, xlbl, xt in zip(c.PARTITION_NAMES, partitions, partitions[1:], c.XLABELS, c.XTICKS):
-        plot(name, i, i2, xlbl, xt)
+    for f in os.listdir(c.PLOTDIR): os.remove(os.path.join(c.PLOTDIR, f))
+    for oratio in [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]:
+        xcms_results = [f.compare_to_chems(chems, overlap_ratio=Decimal(oratio)) for f in xcms_files]
+        mzmine_results = [f.compare_to_chems(chems, overlap_ratio=Decimal(oratio)) for f in mzmine_files]
+        msdial_results = [f.compare_to_chems(chems, overlap_ratio=Decimal(oratio)) for f in msdial_files]
+    
+        print("\n\n---\n")
+        print(oratio)
+        print(xcms_results)
+        print(mzmine_results)
+        print(msdial_results)
+        
+        Path(c.PLOTDIR).mkdir(exist_ok=True)
+        partitions = list(itertools.accumulate(c.PARTITIONS))
+        for name, i, i2, xlbl, xt in zip(c.PARTITION_NAMES, partitions, partitions[1:], c.XLABELS, c.XTICKS):
+            plot(xcms_results, mzmine_results, msdial_results, name, i, i2, xlbl, xt, oratio)
 
 def main():
     config = ConfigurationState()
